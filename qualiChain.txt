@@ -1,0 +1,496 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/hyperledger/fabric/core/chaincode/shim"
+	pb "github.com/hyperledger/fabric/protos/peer"
+)
+
+// QualiChainCode : Chaincode implementation for insurance record
+type QualiChainCode struct {
+}
+
+// 白条额度
+type IouLimitEntity struct {
+	ObjectType string `json:"docType"`    //类型标识 iouLimitEntity
+	OrgID      string `json:"orgID"`      //机构号
+	OrgName    string `json:"orgName"`    //机构名称
+	IouLimit   string `json:"iouLimit"`   //白条额度
+	CreateTime string `json:"createTime"` //创建时间 in the format of [yyyy-mm-dd HH24:MI:SS]
+	UpdateTime string `json:"updateTime"` //更新时间
+}
+
+//白条列表
+type IouRecord struct {
+	ObjectType string `json:"docType"`    // 类型标示  iouRecord
+	IouId      string `json:"iouId"`      // 白条ID
+	FromOrg    string `json:"fromOrg"`    // 发行机构
+	RecvOrg    string `json:"recvOrg"`    // 接收机构
+	TransTime  string `json:"transTime"`  // 交易时间
+	Amount     string `json:"amount"`     // 交易金额
+	PaidAmt    string `json:"paidAmt"`    // 已还金额
+	IouStatus  string `json:"iouStatus"`  // 白条状态  U/C/P===未生效/已还清/未还清
+	UpdateTime string `json:"updateTime"` // 更新时间
+}
+
+//交易数据
+type Transaction struct {
+	ObjectType   string `json:"docType"`      // 类型标示  transaction
+	ConID        string `json:"conID"`        // 合同号
+	SaleOrg      string `json:"saleOrg"`      // 销售方机构
+	BuyOrg       string `json:"buyOrg"`       // 购买方机构
+	TransType    string `json:"transType"`    // 交易类型
+	Amount       string `json:"amount"`       // 白条金额
+	ConHash      string `json:"conHash"`      // 合同hash
+	LatestStatus string `json:"latestStatus"` // 最新状态  U/A===未支付/已支付
+	TransTime    string `json:"transTime"`    // 交易时间
+	UpdateTime   string `json:"updateTime"`   // 更新时间
+}
+
+// Init : Implementing Init implementation of shim interface
+func (t *QualiChainCode) Init(stub shim.ChaincodeStubInterface) pb.Response {
+	args := stub.GetArgs()
+
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting no arguments (except `init`)")
+	}
+
+	return shim.Success(nil)
+}
+
+// Invoke : Implementing Invoke implementation of shim interface
+func (t *QualiChainCode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
+	function, args := stub.GetFunctionAndParameters()
+	fmt.Println("invoke is running： " + function)
+	fmt.Println("传入参数：")
+	fmt.Println(args)
+	//权限控制等以后再说
+
+	switch function {
+	case "setIouLimit": //设定白条额度
+		return t.setIouLimit(stub, args)
+	case "getIouList": //白条列表
+		return t.getIouList(stub, args)
+	case "getIouLimit": //获取白条额度
+		return t.QuerySinglebyId(stub, args)
+	case "iouRecycle": //白条回收
+		return t.iouRecycle(stub, args)
+	case "addTransaction": //交易录入
+		return t.addTransaction(stub, args)
+	case "updateTransStatus": //状态修改
+		return t.updateTransStatus(stub, args)
+	case "queryTransByConId": //交易查询
+		return t.QuerySinglebyId(stub, args)
+	case "queryTransList": //分页查询
+		return t.queryTransList(stub, args)
+	}
+
+	errMsg := fmt.Sprintln("Received unknown function invocation: [function:", function, ", args:", args, "]. Available functions: `createPolicy, setPolicyNo, retrieveRecord, updatePolicyStatus, triggerPolicyCreatedEvent, checkCCBARefNoExists")
+	return shim.Error(errMsg)
+}
+
+//设定白条额度
+func (t *QualiChainCode) setIouLimit(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	//1. Check args
+	result := t.VertifyArgs(3, args)
+	if result != "" {
+		res := getRetString(1, result)
+		return shim.Error(res)
+	}
+
+	// Assign to the corresponding field
+	orgID := args[0]
+	orgName := args[1]
+	iouLimit := args[2]
+	//创建时间：合约里面获取
+	now := time.Now() //当前的时间
+	timeNow := now.Format("2006-01-02 15:04:05")
+	updateTime := timeNow
+	createTime := timeNow
+	fmt.Println("时间" + timeNow)
+	//时间戳测试
+	txTimestamp, tErr := stub.GetTxTimestamp()
+	if tErr != nil {
+		fmt.Println("Error: get timestamp failed")
+	}
+	updateTime2 := time.Unix(txTimestamp.Seconds, 0)
+	fmt.Println("系统的时间戳：" + updateTime2.Add(time.Hour*time.Duration(8)).Format("2006-01-02 15:04:05"))
+
+	IouLimitEntity := &IouLimitEntity{"iouLimitEntity", orgID, orgName, iouLimit, updateTime, createTime}
+	IouLimitEntityJSONasBytes, err := json.Marshal(IouLimitEntity)
+	//打印
+	fmt.Println("IouLimitEntity:" + string(IouLimitEntityJSONasBytes))
+	err = stub.PutState(orgID, IouLimitEntityJSONasBytes)
+	if err != nil {
+		fmt.Println("setIouLimit:Write data failed")
+		res := getRetString(1, "setIouLimit:Write data failed")
+		return shim.Error(res)
+	}
+	res := getRetByte(0, fmt.Sprintf("白条设置成功 %s", orgName))
+	return shim.Success(res)
+}
+
+//校验参数
+func (t *QualiChainCode) VertifyArgs(count int, args []string) string {
+	argsLen := len(args)
+	if argsLen < count {
+		return "Incorrect number of arguments. Expecting " + strconv.Itoa(count)
+	}
+
+	for i := 0; i < argsLen; i++ {
+		if len(args[i]) <= 0 {
+			return strconv.Itoa(i) + " argument must be a non-empty string"
+		}
+	}
+
+	return ""
+}
+
+//交易录入AddTransaction
+func (t *QualiChainCode) addTransaction(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	//1. Check args
+	result := t.VertifyArgs(6, args)
+	if result != "" {
+		return shim.Error(result)
+	}
+	// 插入交易记录
+	conID := args[0]
+	saleOrg := args[1]
+	buyOrg := args[2]
+	transType := args[3]
+	amount := args[4]
+	conHash := args[5]
+	latestStatus := "U"
+	//创建时间：合约里面获取
+	now := time.Now() //当前的时间
+	timeNow := now.Format("2006-01-02 15:04:05")
+	transTime := timeNow
+	updateTime := timeNow
+	fmt.Println("时间" + timeNow)
+	//交易数据
+	Transaction := &Transaction{"transaction", conID, saleOrg, buyOrg, transType, amount, conHash, latestStatus, transTime, updateTime}
+	TransactionJSONasBytes, err := json.Marshal(Transaction)
+	//打印
+	fmt.Println("IouLimitEntity:" + string(TransactionJSONasBytes))
+	err = stub.PutState(conID, TransactionJSONasBytes)
+	if err != nil {
+		fmt.Println("AddTransaction:Write data failed")
+		res := getRetString(1, "AddTransaction conID:Write data failed")
+		return shim.Error(res)
+	}
+	//====================创建白条======================
+	iouId := conHash
+	fromOrg := saleOrg
+	recvOrg := buyOrg
+	paidAmt := "0"
+	iouStatus := "U"
+	IouRecord := &IouRecord{"iouRecord", iouId, fromOrg, recvOrg, transTime, amount, paidAmt, iouStatus, updateTime}
+	IouRecordJSONasBytes, err := json.Marshal(IouRecord)
+	//打印
+	fmt.Println("IouRecord:" + string(IouRecordJSONasBytes))
+	err = stub.PutState(iouId, IouRecordJSONasBytes)
+	if err != nil {
+		fmt.Println("AddTransaction IouRecord:Write data failed")
+		res := getRetString(1, "AddTransaction iouId:Write data failed")
+		return shim.Error(res)
+	}
+	//白条扣减
+	result2 := GetRoleAndOrgName(stub, IouRecord.FromOrg, amount, "transaction")
+	if result2 != "S" {
+		res := getRetString(1, result2)
+		return shim.Error(res)
+	}
+	res := getRetByte(0, fmt.Sprintf("交易成功 %s", conID))
+	return shim.Success(res)
+}
+
+//状态修改
+func (t *QualiChainCode) updateTransStatus(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	//1. Check args
+	result := t.VertifyArgs(2, args)
+	if result != "" {
+		return shim.Error(result)
+	}
+	// 插入交易记录
+	conID := args[0]
+	status := args[1]
+	//查询账本中是否有对应ID的数据
+	TransactionJSONasBytes, err := stub.GetState(conID)
+	if err != nil {
+		fmt.Println("There is no such data in the state database")
+		res := getRetString(1, conID+":There is no such data in the state database ")
+		return shim.Error(res)
+	}
+	Transaction := new(Transaction)
+	err = json.Unmarshal(TransactionJSONasBytes, &Transaction)
+	if Transaction.LatestStatus != "U" {
+		fmt.Println("Failed to get Transaction.LatestStatus:" + Transaction.LatestStatus)
+		res := getRetString(1, "Failed to get Transaction.LatestStatus:"+Transaction.LatestStatus)
+		return shim.Error(res)
+	}
+	//创建时间：合约里面获取
+	now := time.Now() //当前的时间
+	timeNow := now.Format("2006-01-02 15:04:05")
+	Transaction.UpdateTime = timeNow
+	Transaction.LatestStatus = status
+	iouId := Transaction.ConHash
+	TransactionJSONasBytes2, err := json.Marshal(Transaction)
+	//打印
+	fmt.Println("IouLimitEntity:" + string(TransactionJSONasBytes2))
+	err = stub.PutState(conID, TransactionJSONasBytes2)
+	if err != nil {
+		fmt.Println("updateTransStatus:Write data failed")
+		res := getRetString(1, conID+":updateTransStatus Write data failed")
+		return shim.Error(res)
+	}
+
+	//查询账本中是否有对应ID的数据
+	IouRecordJSONasBytes, err := stub.GetState(iouId)
+	if err != nil {
+		fmt.Println("There is no such data in the books")
+		res := getRetString(1, iouId+":There is no such data in the state database")
+		return shim.Error(res)
+	}
+	IouRecord := new(IouRecord)
+	err = json.Unmarshal([]byte(IouRecordJSONasBytes), &IouRecord)
+
+	IouRecord.IouStatus = "P"
+	IouRecord.UpdateTime = timeNow
+	IouRecordJSONasBytes2, _ := json.Marshal(IouRecord)
+	//打印
+	fmt.Println("IouRecord:" + string(IouRecordJSONasBytes2))
+	err = stub.PutState(iouId, IouRecordJSONasBytes2)
+	if err != nil {
+		fmt.Println("updateTransStatus IouRecord:Write data failed")
+		res := getRetString(1, "updateTransStatus  iouId Write data failed")
+		return shim.Error(res)
+	}
+	//白条生效扣减发起方的白条额度
+	//GetRoleAndOrgName(stub,IouRecord.FromOrg,,"update")
+	res := getRetByte(0, fmt.Sprintf("交易成功 %s", conID))
+	return shim.Success(res)
+}
+
+//白条回收
+func (t *QualiChainCode) iouRecycle(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	//1. Check args
+	result := t.VertifyArgs(2, args)
+	if result != "" {
+		return shim.Error(result)
+	}
+	//创建时间：合约里面获取
+	now := time.Now() //当前的时间
+	timeNow := now.Format("2006-01-02 15:04:05")
+
+	// 插入交易记录
+	iouId := args[0]
+	payAmount, err := strconv.Atoi(args[1])
+	if err != nil {
+		res := getRetString(1, "5th argument nostrobal  must be number")
+		return shim.Error(res)
+	}
+	//查询账本中是否有对应ID的数据
+	IouRecordJSONasBytes, err := stub.GetState(iouId)
+	if err != nil {
+		fmt.Println("There is no such data in the state database")
+		res := getRetString(1, "There is no such data in the state database")
+		return shim.Error(res)
+	}
+	IouRecord := new(IouRecord)
+	err = json.Unmarshal([]byte(IouRecordJSONasBytes), &IouRecord)
+	amount, _ := strconv.Atoi(IouRecord.Amount)
+	PaidAmt, _ := strconv.Atoi(IouRecord.PaidAmt)
+	balance := amount - PaidAmt
+	IouRecord.IouStatus = "C"
+	if payAmount < balance {
+		IouRecord.IouStatus = "P"
+		//IouRecord.PaidAmt := strconv.Itoa(PaidAmt + payAmount)
+	}
+
+	IouRecord.PaidAmt = strconv.Itoa(PaidAmt + payAmount)
+	IouRecord.UpdateTime = timeNow
+	IouRecordJSONasBytes2, _ := json.Marshal(IouRecord)
+	//打印
+	fmt.Println("IouRecord:" + string(IouRecordJSONasBytes2))
+	err = stub.PutState(iouId, IouRecordJSONasBytes2)
+	if err != nil {
+		fmt.Println("iouRecycle IouRecord:Write data failed")
+		res := getRetString(1, "iouRecycle IouRecord:Write data failed")
+		return shim.Error(res)
+	}
+	//白条回收==白条额度加减
+	result2 := GetRoleAndOrgName(stub, IouRecord.FromOrg, args[1], "Recycle")
+	if result2 != "S" {
+		res := getRetString(1, result2)
+		return shim.Error(res)
+	}
+	res := getRetByte(0, fmt.Sprintf("交易成功 %s", iouId))
+	return shim.Success(res)
+}
+
+//====================方法处理===========================
+//获取对应的角色Role和机构名
+func GetRoleAndOrgName(stub shim.ChaincodeStubInterface, orgName string, amount string, flag string) string {
+	queryIouLimitEntityString := fmt.Sprintf("{\"selector\":{\"docType\":\"iouLimitEntity\",\"orgName\":\"%s\"}}", orgName)
+	resultsIterator, err := stub.GetQueryResult(queryIouLimitEntityString)
+	if err != nil {
+		return "GetRoleAndOrgName resultsIterator错误"
+	}
+	defer resultsIterator.Close()
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return "GetRoleAndOrgName queryResponse错误"
+		}
+
+		IouLimitEntity := new(IouLimitEntity)
+		err = json.Unmarshal(queryResponse.Value, IouLimitEntity)
+		payAmount, _ := strconv.Atoi(amount)
+		IouLimit, _ := strconv.Atoi(IouLimitEntity.IouLimit)
+		if flag == "Recycle" {
+			IouLimitEntity.IouLimit = strconv.Itoa(payAmount + IouLimit)
+		} else {
+			IouLimitEntity.IouLimit = strconv.Itoa(IouLimit - payAmount)
+		}
+
+		IouLimitEntityJSONasBytes2, _ := json.Marshal(IouLimitEntity)
+		//打印
+		fmt.Println("IouRecord:" + string(IouLimitEntityJSONasBytes2))
+		err = stub.PutState(IouLimitEntity.OrgID, IouLimitEntityJSONasBytes2)
+		if err != nil {
+			fmt.Println("GetRoleAndOrgName iouRecycle IouRecord:Write data failed")
+			return " GetRoleAndOrgName PutState错误"
+		}
+
+		return "S"
+
+	}
+	return "GetRoleAndOrgName 错误没有查到"
+}
+
+//========================================查询=================
+//通过ID查询
+func (t *QualiChainCode) QuerySinglebyId(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	var name, jsonResp string
+	var err error
+
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting name of the marble to query")
+	}
+
+	name = args[0]
+	valAsbytes, err := stub.GetState(name) //get the marble from chaincode state
+	if err != nil {
+		jsonResp = "{\"Error\":\"Failed to get state for " + name + "\"}"
+		return shim.Error(jsonResp)
+	}
+	fmt.Println(string(valAsbytes))
+	return shim.Success(valAsbytes)
+}
+
+//分页查询==交易分页查询
+//交易数据
+func (t *QualiChainCode) queryTransList(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+	queryString := fmt.Sprintf("{\"selector\":{\"docType\":\"transaction\",\"$or\":[{\"saleOrg\":\"%s\"},{\"buyOrg\":\"%s\"}]}}", args[0], args[0])
+	queryResults, err := getQueryResultForQueryString(stub, queryString)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(queryResults)
+}
+
+//白条列表
+func (t *QualiChainCode) getIouList(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+	queryString := fmt.Sprintf("{\"selector\":{\"docType\":\"iouRecord\",\"$or\":[{\"fromOrg\":\"%s\"},{\"recvOrg\":\"%s\"}]}}", args[0], args[0])
+	queryResults, err := getQueryResultForQueryString(stub, queryString)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(queryResults)
+}
+
+//汇款汇入汇出的具体查询方法
+func getQueryResultForQueryString(stub shim.ChaincodeStubInterface, queryString string) ([]byte, error) {
+
+	resultsIterator, err := stub.GetQueryResult(queryString)
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+	var buffer bytes.Buffer
+	buffer.WriteString("[")
+	bArrayMemberAlreadyWritten := false
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		if bArrayMemberAlreadyWritten == true {
+			buffer.WriteString(",")
+		}
+		buffer.WriteString("{\"Key\":")
+		buffer.WriteString("\"")
+		buffer.WriteString(queryResponse.Key)
+		buffer.WriteString("\"")
+
+		buffer.WriteString(", \"Record\":")
+		buffer.WriteString(string(queryResponse.Value))
+		buffer.WriteString("}")
+		bArrayMemberAlreadyWritten = true
+	}
+	buffer.WriteString("]")
+
+	fmt.Printf("- getQueryResultForQueryString queryResult:\n%s\n", buffer.String())
+	return buffer.Bytes(), nil
+}
+
+// chaincode response结构
+type chaincodeRet struct {
+	Code int    // 0 success otherwise 1
+	Des  string //description
+}
+
+// 成功返回
+func getRetByte(code int, des string) []byte {
+	var r chaincodeRet
+	r.Code = code
+	r.Des = des
+
+	b, err := json.Marshal(r)
+
+	if err != nil {
+		fmt.Println("marshal Ret failed")
+		return nil
+	}
+	return b
+}
+
+// 失败返回
+func getRetString(code int, des string) string {
+	var r chaincodeRet
+	r.Code = code
+	r.Des = des
+
+	b, err := json.Marshal(r)
+
+	if err != nil {
+		fmt.Println("marshal Ret failed")
+		return ""
+	}
+
+	return string(b[:])
+}
+
+func main() {
+	err := shim.Start(new(QualiChainCode))
+	if err != nil {
+		fmt.Printf("Error starting IOU record chaincode: %s", err)
+	}
+}
